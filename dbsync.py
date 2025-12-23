@@ -190,7 +190,55 @@ def _run_geodiff(
         logging.error("GEODIFF: " + geodiff_stderr)
     if res.returncode != 0:
         raise DbSyncError("geodiff failed!\n" + str(cmd))
+    
 
+def _has_only_noop_updates(changeset_path: str) -> bool:
+    """
+    Workaround for geodiff bug #181 (UPDATE ... SET WHERE ...):
+    geodiff sometimes reports an UPDATE but produces an empty list of changed columns.
+    In JSON exported via `geodiff as-json` this shows as:
+        {"type": "update", "changes": []}
+    If the whole changeset consists only of these no-op updates, we can safely skip apply.
+    """
+    try:
+        details = _geodiff_list_changes_details(changeset_path)
+    except Exception as e:
+        # If we can't inspect, do not skip apply.
+        logging.debug(f"Failed to inspect changeset via as-json: {e}")
+        return False
+
+    if not details:
+        # No changes at all
+        return True
+
+    meaningful = 0
+    noop_updates = 0
+    for ch in details:
+        ch_type = ch.get("type")
+        ch_changes = ch.get("changes")
+        if ch_type == "update" and (not ch_changes):
+            noop_updates += 1
+            continue
+        meaningful += 1
+
+    if meaningful == 0 and noop_updates > 0:
+        logging.warning(
+            "Detected changeset with only no-op UPDATEs (geodiff bug #181). "
+            "Skipping apply to avoid SQL 'UPDATE ... SET WHERE ...' failure."
+        )
+        return True
+    return False
+
+
+def _geodiff_apply_changeset_guarded(driver, conn_info, base, changeset, ignored_tables):
+    """
+    Apply changeset with a guard against 'empty UPDATE SET' (geodiff issue #181).
+    - If changeset contains only no-op updates -> skip apply (safe).
+    - Otherwise -> do regular apply.
+    """
+    if _has_only_noop_updates(changeset):
+        return
+    _geodiff_apply_changeset(driver, conn_info, base, changeset, ignored_tables)
 
 def _geodiff_create_changeset(
     driver,
@@ -841,8 +889,8 @@ def pull(conn_cfg, mc):
 
     if not needs_rebase:
         logging.debug("Applying new version [no rebase]")
-        _geodiff_apply_changeset(conn_cfg.driver, conn_cfg.conn_info, conn_cfg.base, tmp_base2their, ignored_tables)
-        _geodiff_apply_changeset(conn_cfg.driver, conn_cfg.conn_info, conn_cfg.modified, tmp_base2their, ignored_tables)
+        _geodiff_apply_changeset_guarded(conn_cfg.driver, conn_cfg.conn_info, conn_cfg.base, tmp_base2their, ignored_tables)
+        _geodiff_apply_changeset_guarded(conn_cfg.driver, conn_cfg.conn_info, conn_cfg.modified, tmp_base2their, ignored_tables)
     else:
         logging.debug("Applying new version [WITH rebase]")
         tmp_conflicts = os.path.join(tmp_dir, f"{project_name}-dbsync-pull-conflicts")
@@ -855,7 +903,7 @@ def pull(conn_cfg, mc):
             tmp_conflicts,
             ignored_tables,
         )
-        _geodiff_apply_changeset(conn_cfg.driver, conn_cfg.conn_info, conn_cfg.base, tmp_base2their, ignored_tables)
+        _geodiff_apply_changeset_guarded(conn_cfg.driver, conn_cfg.conn_info, conn_cfg.base, tmp_base2their, ignored_tables)
 
     os.remove(gpkg_basefile_old)
     conn = psycopg2.connect(conn_cfg.conn_info)
@@ -1068,7 +1116,7 @@ def push(conn_cfg, mc):
 
     # update base schema in the DB
     logging.debug("Updating DB base schema...")
-    _geodiff_apply_changeset(conn_cfg.driver, conn_cfg.conn_info, conn_cfg.base, tmp_changeset_file, ignored_tables)
+    _geodiff_apply_changeset_guarded(conn_cfg.driver, conn_cfg.conn_info, conn_cfg.base, tmp_changeset_file, ignored_tables)
     _set_db_project_comment(conn, conn_cfg.base, conn_cfg.mergin_project, version)
 
 
