@@ -194,40 +194,30 @@ def _run_geodiff(
 
 def _has_only_noop_updates(changeset_path: str) -> bool:
     """
-    Workaround for geodiff bug #181 (UPDATE ... SET WHERE ...):
-    geodiff sometimes reports an UPDATE but produces an empty list of changed columns.
-    In JSON exported via `geodiff as-json` this shows as:
-        {"type": "update", "changes": []}
-    If the whole changeset consists only of these no-op updates, we can safely skip apply.
+    True if changeset contains no meaningful changes:
+    - empty changeset OR
+    - only updates where none of the 'changes' entries contains 'new'
+      (fake updates from geodiff #181 / empty SET case)
     """
     try:
         details = _geodiff_list_changes_details(changeset_path)
     except Exception as e:
-        # If we can't inspect, do not skip apply.
         logging.debug(f"Failed to inspect changeset via as-json: {e}")
         return False
 
     if not details:
-        # No changes at all
         return True
 
-    meaningful = 0
-    noop_updates = 0
-    for ch in details:
-        ch_type = ch.get("type")
-        ch_changes = ch.get("changes")
-        if ch_type == "update" and (not ch_changes):
-            noop_updates += 1
-            continue
-        meaningful += 1
+    for item in details:
+        t = item.get("type")
+        if t != "update":
+            return False  # insert/delete/etc => meaningful
 
-    if meaningful == 0 and noop_updates > 0:
-        logging.warning(
-            "Detected changeset with only no-op UPDATEs (geodiff bug #181). "
-            "Skipping apply to avoid SQL 'UPDATE ... SET WHERE ...' failure."
-        )
-        return True
-    return False
+        changes = item.get("changes", [])
+        if any("new" in c for c in changes):
+            return False  # meaningful update
+
+    return True  # only fake updates
 
 
 def _geodiff_apply_changeset_guarded(driver, conn_info, base, changeset, ignored_tables):
@@ -239,6 +229,31 @@ def _geodiff_apply_changeset_guarded(driver, conn_info, base, changeset, ignored
     if _has_only_noop_updates(changeset):
         return
     _geodiff_apply_changeset(driver, conn_info, base, changeset, ignored_tables)
+
+def _changeset_has_real_changes(changeset_path: str) -> bool:
+    """
+    Returns False for changesets that contain only 'fake updates' (updates with no 'new' values),
+    which typically lead to invalid SQL like: UPDATE ... SET WHERE ...
+    """
+    details = _geodiff_list_changes_details(changeset_path)
+    if not details:
+        return False
+
+    for item in details:
+        t = item.get("type")
+        if t != "update":
+            return True  # insert/delete/conflict etc. => real change
+
+        changes = item.get("changes", [])
+        # "Real" update should contain at least one change with 'new' key
+        if any("new" in c for c in changes):
+            return True
+
+        # If update has no 'new' anywhere -> it's a fake update -> ignore
+        # continue checking others
+
+    # if we got here: only fake updates
+    return False
 
 def _geodiff_create_changeset(
     driver,
@@ -1099,6 +1114,15 @@ def push(conn_cfg, mc):
     # summarize changes
     summary = _geodiff_list_changes_summary(tmp_changeset_file)
     _print_changes_summary(summary)
+
+
+    # NEW: ignore fake updates which lead to UPDATE ... SET WHERE ...
+    if not _changeset_has_real_changes(tmp_changeset_file):
+        logging.warning(
+            "Geodiff produced a changeset with updates but no new values (likely fake updates). "
+            "Skipping apply to avoid invalid SQL."
+        )
+        return
 
     # write changes to the local geopackage
     logging.debug("Writing DB changes to working dir...")
